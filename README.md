@@ -45,9 +45,11 @@ Process Hollowing (T1055.012) · APC Injection (T1055.004); on Linux the
 injector route uses ptrace (T1055.008).
 
 **PE Injection (T1055.002)** — tick the box and pick a host executable
-(e.g. putty.exe): the loader spawns it suspended, unmapping/re-mapping its
-image and writing the shellcode at the entry point, so the payload executes
-under the host PE's identity.
+(e.g. putty.exe): the loader spawns it SUSPENDED, writes the shellcode into
+the child, then resumes the host and fires the payload on a second thread.
+The real program opens and runs normally; the payload executes beside it
+under the host's identity, name and token. `EXITFUNC=thread` is forced on
+msfvenom builds so the payload never kills the host on session exit.
 
 **Encryption** — XOR Dynamic (rolling per-build key) · RC4 · AES-CTR (openssl,
 Bcrypt/CryptoAPI in the loader). **Sandbox Evasion** — pre-exec sleep with ±35%
