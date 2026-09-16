@@ -1357,6 +1357,20 @@ def launch_gui():
         print("tkinter not available — install python3-tk (Kali: sudo apt install python3-tk)")
         return 1
     root = tk.Tk()
+
+    def _log_cb_exc(exc_type, exc_value, exc_tb):
+        """Tkinter swallows exceptions raised inside callbacks — they never
+        reach main()'s try/except and die on stderr, which is invisible when
+        the app is launched detached. Route them into crash.log instead."""
+        import traceback as tb
+        log = os.path.join(STATE_DIR, "crash.log")
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(log, "a") as fh:
+            fh.write("\n" + _time.strftime("%Y-%m-%d %H:%M:%S") + " (GUI callback)\n")
+            tb.print_exception(exc_type, exc_value, exc_tb, file=fh)
+
+    root.report_callback_exception = _log_cb_exc
+
     ForgeGUI(root)
     # make sure the window is on-screen and front-and-center
     root.update_idletasks()
