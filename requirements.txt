@@ -1,0 +1,15 @@
+# Payload Forge — runtime requirements
+#
+# The GUI app (forge.py) is pure Python stdlib: there are NO pip packages.
+# The browser tool (payload-forge.html) needs nothing but a browser.
+# What you DO need are system packages:
+#
+#   Debian/Kali:  sudo apt install python3 python3-tk metasploit-framework \
+#                     gcc-mingw-w64 openssl
+#   Arch:         see offsec-setup.sh (installs everything automatically)
+#
+# tkinter ships with python3-tk (system package, not pip).
+# msfvenom comes from metasploit-framework and is only needed at build time
+# for MSFvenom payloads; Custom (C2 implant) builds work without it.
+# gcc-mingw-w64 lets forge.py auto-compile Windows loaders on Linux;
+# without it the emitted build.sh compiles them later.

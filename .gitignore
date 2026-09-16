@@ -1,0 +1,19 @@
+# --- scratch / debug artifacts (never commit) ---
+_scratch/
+tests/out/
+_t-*
+_forge-*.log
+*.log
+
+# --- app state / build output ---
+.payload-forge/
+builds/
+
+# --- python ---
+__pycache__/
+*.pyc
+
+# --- local env ---
+.freebuff/
+.vscode/
+.idea/
