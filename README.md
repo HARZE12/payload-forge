@@ -53,7 +53,7 @@ no relocations), fires the payload on a second thread, then jumps to the
 original entry point. **The output IS the host program** — same name, icon,
 version info — it opens and runs normally while the payload executes beside
 it. One file in, one file out: deliver the patched executable, no separate
-loader. x64 hosts only; PE embedding requires `pip install keystone-engine`.
+loader. x64 hosts only; no extra dependencies — the entry stub ships pre-assembled.
 
 **Encryption** — XOR Dynamic (rolling per-build key) · RC4 · AES-CTR (openssl,
 Bcrypt/CryptoAPI in the loader). **Sandbox Evasion** — pre-exec sleep with ±35%

