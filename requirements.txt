@@ -1,6 +1,8 @@
 # Payload Forge — runtime requirements
 #
-# The GUI app (forge.py) is pure Python stdlib: there are NO pip packages.
+# The GUI app (forge.py) is pure Python stdlib, with ONE optional extra:
+#   pip install keystone-engine     # only needed for PE embedding (T1055.002)
+#                                     patching a payload into a host .exe
 # The browser tool (payload-forge.html) needs nothing but a browser.
 # What you DO need are system packages:
 #

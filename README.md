@@ -44,12 +44,16 @@ your C2 (Sliver, Havoc, Mythic Athena/Apollo, Mettle).
 Process Hollowing (T1055.012) · APC Injection (T1055.004); on Linux the
 injector route uses ptrace (T1055.008).
 
-**PE Injection (T1055.002)** — tick the box and pick a host executable
-(e.g. putty.exe): the loader spawns it SUSPENDED, writes the shellcode into
-the child, then resumes the host and fires the payload on a second thread.
-The real program opens and runs normally; the payload executes beside it
-under the host's identity, name and token. `EXITFUNC=thread` is forced on
-msfvenom builds so the payload never kills the host on session exit.
+**PE Injection (T1055.002) — true file embedding** — tick the box and pick a
+host executable (e.g. putty.exe): forge appends a `.pfsg` section to the host
+PE containing the XOR-encrypted shellcode plus a 253-byte x64 entry stub, and
+repoints the entry. The stub decrypts the stage in place, resolves
+`CreateThread` via a PEB→Ldr→kernel32 export-table walk (ASLR-proof,
+no relocations), fires the payload on a second thread, then jumps to the
+original entry point. **The output IS the host program** — same name, icon,
+version info — it opens and runs normally while the payload executes beside
+it. One file in, one file out: deliver the patched executable, no separate
+loader. x64 hosts only; PE embedding requires `pip install keystone-engine`.
 
 **Encryption** — XOR Dynamic (rolling per-build key) · RC4 · AES-CTR (openssl,
 Bcrypt/CryptoAPI in the loader). **Sandbox Evasion** — pre-exec sleep with ±35%
